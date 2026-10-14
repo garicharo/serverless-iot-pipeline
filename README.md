@@ -57,16 +57,26 @@ La función está en `lambdas/rules.js`.
 
 No es el warehouse. Guarda la configuración del dispositivo, el estado, la lectura reconciliada y las últimas cinco mediciones. Esas dos, la lectura reconciliada y el estado, no se podían perder entre sincronizaciones. El histórico que se consulta vive en Aurora PostgreSQL. Los archivos viven en S3.
 
-La única llave que está escrita es la de la medición: id de dispositivo y timestamp en milisegundos. El hardware no emitía dos mediciones distintas del mismo dispositivo en el mismo milisegundo. Una segunda ejecución cae en el mismo ítem. Eso es la idempotencia.
+La llave de la medición es el id del dispositivo más el id del request de API Gateway. Cada dispositivo que manda mediciones tiene su propio id. Una puerta que no trae request, MQTT o el cron, usa el mismo id de dispositivo más el timestamp. El hardware no emitía dos mediciones distintas del mismo dispositivo en el mismo milisegundo. Una segunda ejecución con esa misma pareja cae en el mismo ítem. Eso es la idempotencia. La cola FIFO usa esa misma pareja como id de deduplicación. La ventana de la cola es de cinco minutos.
 
-Se usaron un GSI y un LSI. El LSI comparte la partition key y se define al crear la tabla. El GSI era para una consulta que no era la llave del dispositivo. Cuál consulta iba en cuál índice no está en este repositorio. No se inventa el nombre del atributo. El stream de la tabla es una creencia para verificar que el ítem calculado había quedado escrito, no un hecho cerrado.
+Los índices existen para consultar la jerarquía y los datos ya agregados. La pregunta es cuáles dispositivos pertenecen a un país, una región, una planta o una línea, y cuál es el total de ese grupo. El nombre del atributo de cada índice no está escrito. El stream de la tabla es una creencia para verificar que el ítem calculado había quedado escrito, no un hecho cerrado.
 
 | Consulta | Para qué | Dónde cae |
 | --- | --- | --- |
-| Esta medición | Idempotencia y el punto en la serie | Tabla base, dispositivo + timestamp |
+| Esta medición | Idempotencia y el punto en la serie | Tabla base, dispositivo + request, o dispositivo + timestamp |
+| Dispositivos de un grupo | País, región, planta o línea | Índice de la jerarquía |
+| Total del grupo | Cuánto consumió ese grupo en el periodo | Índice del agregado, y el mismo total en S3 y en PostgreSQL |
 | Últimas cinco | Intercalar un acumulado tarde y recalcular deltas | Las cinco del dispositivo. El sort key exacto no está escrito |
 | Configuración | Split, hex a decimal, factor, unidad, acumulado o intervalo, cadencia, lugar en la jerarquía | Fila de metadata del dispositivo |
 | Estado y último visto | Tablero de silencio a las 3, 6, 12 y 24 horas | Estado del dispositivo. El índice de esa consulta no está escrito |
+
+## Suma por grupo
+
+Una planta puede no tener un medidor propio. El total de esa planta es la suma de sus medidores: veinte medidores, en diez máquinas, en cuatro líneas. El índice dice cuáles entran. La operación que se repite suma sus deltas. El histórico y el delta llegan combinados; lo que se suma para el consumo del periodo es el delta, porque el acumulado es la marca del medidor, no el consumo del grupo.
+
+Ese total se guarda en S3 y en el histórico de PostgreSQL. La consulta de operación lee el total ya escrito. No recorre los veinte medidores en cada pregunta.
+
+Cuando sí hay medidor de planta, ese medidor no se suma encima de los medidores de línea. Las áreas sin medidor propio salen de restar las líneas conocidas al medidor de planta. Sumar los dos contaría dos veces.
 
 La lectura por defecto de DynamoDB es eventualmente consistente. Dos lotes pueden traer el mismo minuto: un lote era de unas 60 filas y podía incluir un minuto que otra Lambda ya había procesado. El punto encuentra su lugar por timestamp dentro de las cinco, no por un candado distribuido. Una lectura fuertemente consistente de esas cinco sería la forma segura de no calcular el delta con una ventana vieja. No está escrito que la consola tuviera `ConsistentRead` prendido.
 
@@ -89,10 +99,10 @@ La tabla de DynamoDB del oeste existía porque el stack ya estaba levantado. No 
 
 Es una arquitectura serverless dirigida por eventos, y no es solo eso.
 
-- Eventos en las puertas. MQTT, HTTP y un schedule de cerca de cinco minutos empujan trabajo. Nadie deja un servidor esperando.
+- Eventos en las puertas. MQTT, HTTP y un schedule de cerca de cinco minutos empujan trabajo al mismo flujo. El schedule llama a un servicio de un tercero: energía generada por paneles solares. Nadie deja un servidor esperando.
 - Orquestación del lote. Step Functions recorre raw, formatted/stage y enrichment. Si un paso falla, ese paso falla. El anterior ya dejó la lectura. La dead-letter queue recibe el fallo.
 - Reglas en datos. La variación del medidor es una fila, no un cambio de código.
-- Consumidor idempotente. La llave dispositivo + milisegundo absorbe la segunda ejecución entre API Gateway y Lambda. La causa de esa doble ejecución no está escrita. La cola FIFO también deduplicaba. La cadena del id de deduplicación no está escrita. La ventana de la cola es de cinco minutos.
+- Consumidor idempotente. La llave es el id del dispositivo más el id del request de API Gateway, o el id del dispositivo más el timestamp en las otras puertas. La causa de la doble ejecución no está escrita. La cola FIFO deduplica con esa misma pareja. La ventana de la cola es de cinco minutos.
 - Almacenes separados por acceso. DynamoDB es el estado caliente. S3 es el archivo. Aurora es el histórico. No es una sola tabla para todo.
 - Standby tibio. us-east-1 atiende. us-west-1 ya está desplegado y no recibe el tráfico. Route 53 conmuta el nombre de la API. Los schedules del oeste no deben dispararse solos, porque un failover de DNS no mueve un EventBridge.
 
@@ -106,6 +116,12 @@ El cuello que sí apareció no fue la concurrencia de Lambda. Fue el tamaño de 
 
 El arranque en frío dejó de ser parte del diseño porque la ingesta era seguida. No hay un número de concurrencia reservada en esta descripción.
 
+## Energía generada y consumida
+
+Las tres puertas se combinan en un solo esquema: MQTT, API Gateway y el cron de EventBridge.
+
+Ese cron pide a un tercero la energía generada por paneles solares. En el mismo pipeline también entra la energía consumida, medida. No hacía falta calcular el consumo para tenerlo: las dos series ya llegaban. Con los datos sí se podía calcular. Un acumulado deja el delta del tramo, y ese camino ya está en `placeCumulative`. Para esta energía el cálculo estaba preparado y no era el que se usaba para obtener el consumo, porque el consumo ya venía.
+
 ## Flujo
 
 ```mermaid
@@ -116,7 +132,7 @@ flowchart LR
   iot --> door
   apigw --> lambda["Lambda"]
   door --> lambda
-  partner["Partner API"] --> poll["EventBridge, cerca de 5 min"]
+  partner["Tercero: energía generada, paneles"] --> poll["EventBridge, cerca de 5 min"]
   poll --> lambda
   lambda --> dynamo["DynamoDB"]
   lambda --> firehose["Kinesis Firehose"]
@@ -157,7 +173,7 @@ sequenceDiagram
   participant Db as DynamoDB
   participant Q as SQS FIFO
   Api->>Fn: la misma lectura, otra vez
-  Fn->>Db: put si no existe dispositivo + milisegundo
+  Fn->>Db: put si no existe dispositivo + request, o dispositivo + timestamp
   alt ítem nuevo
     Fn->>Q: un envío
     Q->>Fn: Firehose recibe una vez
@@ -181,4 +197,4 @@ CDK publicaba dos stacks de CloudFormation desde un push de GitLab. El hostname 
 
 ## Qué no está en este repositorio
 
-El CDK, las memorias y los timeouts de cada Lambda, el id de deduplicación de la cola, la causa de la doble ejecución, el atributo exacto del GSI y del LSI, streams contra global table, el certificado del dispositivo, y el factor numérico de cada unidad.
+El CDK, las memorias y los timeouts de cada Lambda, la causa de la doble ejecución, el nombre exacto del atributo en el GSI y en el LSI, streams contra global table, el certificado del dispositivo, y el factor numérico de cada unidad.
