@@ -1,0 +1,7 @@
+{
+  "name": "serverless-iot-pipeline",
+  "private": true,
+  "scripts": {
+    "test": "node --test test/rules.test.js"
+  }
+}
