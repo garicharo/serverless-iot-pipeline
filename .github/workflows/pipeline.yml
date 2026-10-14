@@ -1,0 +1,69 @@
+name: pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      hosted_zone_id:
+        description: Route 53 hosted zone id
+        required: false
+      record_name:
+        description: Failover record, for example ingest.example.com
+        required: false
+      west_api_host:
+        description: Standby execute-api hostname, without https
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  synth:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npx cdk synth
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cloudformation
+          path: cdk.out/*.template.json
+
+  deploy:
+    if: github.event_name == 'workflow_dispatch'
+    needs: synth
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+      - name: Deploy both stacks
+        env:
+          PARTNER_URL: ${{ secrets.PARTNER_URL }}
+          HOSTED_ZONE_ID: ${{ inputs.hosted_zone_id }}
+          RECORD_NAME: ${{ inputs.record_name }}
+          WEST_API_HOST: ${{ inputs.west_api_host }}
+        run: |
+          npx cdk deploy PipelineEast PipelineWest --require-approval never \
+            --parameters PipelineEast:PartnerUrl="$PARTNER_URL" \
+            --parameters PipelineWest:PartnerUrl="$PARTNER_URL" \
+            --parameters PipelineEast:HostedZoneId="$HOSTED_ZONE_ID" \
+            --parameters PipelineEast:RecordName="$RECORD_NAME" \
+            --parameters PipelineEast:WestApiHost="$WEST_API_HOST"

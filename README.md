@@ -193,8 +193,25 @@ flowchart TB
   west --> idle["Lambdas y tabla presentes, sin tráfico de producción"]
 ```
 
-CDK publicaba dos stacks de CloudFormation desde un push de GitLab. El hostname único, si lo había, vivía delante de las dos APIs. Cada API regional conserva su URL de execute-api. Un failover de Route 53 mueve el nombre. No mueve los schedules.
+El hostname único, si lo había, vivía delante de las dos APIs. Cada API regional conserva su URL de execute-api. Un failover de Route 53 mueve el nombre cuando la sonda HTTPS contra `/live/health` de Virginia falla. No mueve los schedules. En este repositorio la sonda es cada 30 segundos y falla al tercer intento. Ese intervalo no es el de la consola: no estaba escrito.
+
+## Stacks y pipeline
+
+Este repositorio vive en GitHub, así que el pipeline es GitHub Actions, en `.github/workflows/pipeline.yml`. Cada push corre las pruebas y `cdk synth`. El deploy es un disparo manual: Actions asume un rol con OIDC y CDK aplica CloudFormation. No hay llaves en el repo. Los secretos del deploy son `AWS_ROLE_ARN` y `PARTNER_URL`.
+
+En el trabajo el push era GitLab. Ese runner no se copia aquí, porque este código no está en GitLab. CloudFormation sigue siendo quien crea los recursos. Son dos stacks:
+
+| Stack | Región | Qué hace |
+| --- | --- | --- |
+| PipelineEast | us-east-1 | Atiende. Cron, regla MQTT y tablero de silencio prendidos. Crea el clúster global de Aurora y el puente EC2. |
+| PipelineWest | us-west-1 | Ya está desplegado. Cron, regla MQTT y silencio apagados. Se une al clúster global como réplica. No hay puente EC2. |
+
+La tabla de DynamoDB de cada stack es regional. Este template no declara streams ni una global table. Los nombres `groupKey`, `memberId`, `by-group` y `by-time` son el modelo de este repositorio. El LSI `by-time` comparte el dispositivo y ordena sus mediciones. El GSI `by-group` responde la jerarquía y el total del grupo. El atributo de producción no está escrito.
+
+El orden de deploy es este. Primero el este, que crea el clúster global. Después el oeste, que se une. Al final, otra vez el este con `HostedZoneId`, `RecordName` y `WestApiHost`: ahí aparecen los dos registros de failover. Sin esos tres valores el stack del este no crea DNS.
+
+Los números de memoria, timeout, ACU, el tipo de la instancia puente y la sonda están en `lib/config.ts`.
 
 ## Qué no está en este repositorio
 
-El CDK, las memorias y los timeouts de cada Lambda, la causa de la doble ejecución, el nombre exacto del atributo en el GSI y en el LSI, streams contra global table, el certificado del dispositivo, y el factor numérico de cada unidad.
+La causa de la doble ejecución, el nombre de producción del atributo en el GSI y en el LSI, streams contra global table, el certificado del dispositivo, el factor numérico de cada unidad, y el intervalo real de la sonda.
